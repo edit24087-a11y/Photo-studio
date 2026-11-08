@@ -2012,7 +2012,7 @@ const Tools = {
   },
   buildToolbar() {
     const g = $('#toolgrid'); g.textContent = '';
-    this.order.forEach(id => { const t = this.list[id]; g.append(h('button', { class: 'tool', 'data-tool': id, 'data-tip': t.name + (t.key ? ` (${t.key.toUpperCase()})` : ''), html: icon(t.icon, 19), onclick: () => this.set(id) })); });
+    this.order.forEach(id => { const t = this.list[id]; g.append(h('button', { class: 'tool', 'data-tool': id, 'data-tip': t.name + (t.shortcut ? ` (${t.shortcut.toUpperCase()})` : ''), html: icon(t.icon, 19), onclick: () => this.set(id) })); });
   },
   paintTarget() {
     const d = App.doc, L = d && d.active; if (!L) { toast('No layer selected', 'warn'); return null; } if (L.locked) { toast('Layer is locked', 'warn'); return null; }
@@ -2059,7 +2059,7 @@ const modeSeg = o => OB.seg(o, 'mode', MODES);
    SELECTION & NAVIGATION TOOLS
    ===================================================================== */
 Tools.register({
-  id: 'move', name: 'Move', key: 'v', icon: 'move', cursor: 'default', hint: 'Drag to move layers · Shift-click to multi-select · arrow keys nudge · smart guides snap to edges & centers',
+  id: 'move', name: 'Move', shortcut: 'v', icon: 'move', cursor: 'default', hint: 'Drag to move layers · Shift-click to multi-select · arrow keys nudge · smart guides snap to edges & centers',
   options() {
     const ab = (t, kind, tip) => OB.btn(t, () => LM.align(kind), tip);
     return [OB.check('Auto-select', O.move, 'auto'), OB.check('Snap', View, 'snap'), OB.sep(), h('div', { class: 'opt' }, h('span', { class: 'lbl', text: 'Align' }), ab('⇤', 'left', 'Align left'), ab('↔', 'hcenter', 'Align horizontal centers'), ab('⇥', 'right', 'Align right'), ab('⤒', 'top', 'Align top'), ab('↕', 'vcenter', 'Align vertical centers'), ab('⤓', 'bottom', 'Align bottom')),
@@ -2092,7 +2092,7 @@ Tools.register({
   }
 });
 Tools.register({
-  id: 'marquee', name: 'Marquee', key: 'm', icon: 'marquee', hint: 'Drag to select a rectangle/ellipse · click inside a selection to move it · click elsewhere to deselect',
+  id: 'marquee', name: 'Marquee', shortcut: 'm', icon: 'marquee', hint: 'Drag to select a rectangle/ellipse · click inside a selection to move it · click elsewhere to deselect',
   options() { return [OB.seg(O.marquee, 'shape', [['rect', 'Rectangle'], ['ellipse', 'Ellipse']]), modeSeg(O.marquee), OB.range('Feather', O.marquee, 'feather', 0, 100, 1, 'px'), OB.check('Square / Circle', O.marquee, 'square'), OB.check('From center', O.marquee, 'center')]; },
   animated: false,
   rectOf(p) {
@@ -2126,7 +2126,7 @@ Tools.register({
   cancel() { this.a = null; this.mvSel = null; }
 });
 Tools.register({
-  id: 'lasso', name: 'Lasso', key: 'l', icon: 'lasso', hint: 'Drag to draw a freehand selection',
+  id: 'lasso', name: 'Lasso', shortcut: 'l', icon: 'lasso', hint: 'Drag to draw a freehand selection',
   options() { return [modeSeg(O.lasso), OB.range('Feather', O.lasso, 'feather', 0, 100, 1, 'px')]; },
   down(p) { this.pts = [{ x: p.x, y: p.y }]; this.mode = Tools.modeFrom(p, O.lasso.mode); },
   move(p) { if (!this.pts) return; const l = this.pts[this.pts.length - 1]; if (Math.hypot(p.x - l.x, p.y - l.y) * App.doc.zoom > 2) this.pts.push({ x: p.x, y: p.y }); },
@@ -2135,7 +2135,7 @@ Tools.register({
   cancel() { this.pts = null; }
 });
 Tools.register({
-  id: 'polylasso', name: 'Polygonal Lasso', key: 'shift+l', icon: 'polylasso', animated: true, hint: 'Click to add points · double-click, Enter or click the first point to close · Backspace removes a point · Esc cancels',
+  id: 'polylasso', name: 'Polygonal Lasso', shortcut: 'shift+l', icon: 'polylasso', animated: true, hint: 'Click to add points · double-click, Enter or click the first point to close · Backspace removes a point · Esc cancels',
   options() { return [modeSeg(O.poly), OB.range('Feather', O.poly, 'feather', 0, 100, 1, 'px'), OB.btn('Close', () => this.close(), 'Enter'), OB.btn('Cancel', () => this.cancel(), 'Esc')]; },
   down(p) {
     if (!this.pts) { this.pts = []; this.mode = Tools.modeFrom(p, O.poly.mode); }
@@ -2155,7 +2155,7 @@ Tools.register({
   deactivate() { this.pts = null; }
 });
 Tools.register({
-  id: 'wand', name: 'Magic Wand', key: 'w', icon: 'wand', hint: 'Click to select pixels of similar color',
+  id: 'wand', name: 'Magic Wand', shortcut: 'w', icon: 'wand', hint: 'Click to select pixels of similar color',
   options() { return [modeSeg(O.wand), OB.range('Tolerance', O.wand, 'tol', 0, 255), OB.check('Contiguous', O.wand, 'contig'), OB.check('Sample all layers', O.wand, 'sampleAll')]; },
   down(p) {
     const d = App.doc, L = d.active; if (!O.wand.sampleAll && (!L || !L.canvas)) { toast('Select a pixel layer or enable "Sample all layers"', 'warn'); return; }
@@ -2179,7 +2179,7 @@ function objectSelect(d, x0, y0, x1, y1, tol) {
   return new Selection(d.w, d.h, m).feather(1.2);
 }
 Tools.register({
-  id: 'object', name: 'Object Selection', key: 'shift+w', icon: 'object', hint: 'Drag a box around an object; pixels that differ from the box edge colors are selected (color-based, not AI)',
+  id: 'object', name: 'Object Selection', shortcut: 'shift+w', icon: 'object', hint: 'Drag a box around an object; pixels that differ from the box edge colors are selected (color-based, not AI)',
   options() { return [modeSeg(O.object), OB.range('Sensitivity', O.object, 'tol', 5, 120), h('span', { class: 'lbl', text: 'Color-difference based: works best on plain backgrounds.' })]; },
   down(p) { this.a = { x: p.x, y: p.y, mode: Tools.modeFrom(p, O.object.mode) }; this.b = p; }, move(p) { this.b = p; },
   up(p) {
@@ -2195,7 +2195,7 @@ function dimOutside(k, d, sx0, sy0, sx1, sy1) {
   k.fillRect(x0, y0, x1 - x0, sy0 - y0); k.fillRect(x0, sy1, x1 - x0, y1 - sy1); k.fillRect(x0, sy0, sx0 - x0, sy1 - sy0); k.fillRect(sx1, sy0, x1 - sx1, sy1 - sy0); k.restore();
 }
 Tools.register({
-  id: 'crop', name: 'Crop', key: 'c', icon: 'crop', animated: false, hint: 'Drag to define the crop area · drag handles to adjust · Enter applies · Esc cancels',
+  id: 'crop', name: 'Crop', shortcut: 'c', icon: 'crop', animated: false, hint: 'Drag to define the crop area · drag handles to adjust · Enter applies · Esc cancels',
   options() {
     return [OB.select('Ratio', O.crop, 'ratio', [['free', 'Free'], ['original', 'Original'], '1:1', '4:3', '3:2', '16:9', '9:16', '5:4']), OB.btn('✓ Apply crop', () => this.apply(), 'Enter', 'primary'), OB.btn('Cancel', () => this.cancel(), 'Esc')];
   },
@@ -2232,7 +2232,7 @@ Tools.register({
   deactivate() { this.r = null; }
 });
 Tools.register({
-  id: 'pcrop', name: 'Perspective Crop', key: 'shift+c', icon: 'pcrop', hint: 'Drag the four corners onto a skewed rectangle, then press Enter to straighten it',
+  id: 'pcrop', name: 'Perspective Crop', shortcut: 'shift+c', icon: 'pcrop', hint: 'Drag the four corners onto a skewed rectangle, then press Enter to straighten it',
   options() { return [OB.btn('✓ Apply', () => this.apply(), 'Enter', 'primary'), OB.btn('Reset corners', () => { this.q = null; View.odirty(); }), OB.btn('Cancel', () => this.cancel(), 'Esc')]; },
   ensure() { const d = App.doc; if (!this.q || this.did !== d.id) { const m = 0.12; this.q = [[d.w * m, d.h * m], [d.w * (1 - m), d.h * m], [d.w * (1 - m), d.h * (1 - m)], [d.w * m, d.h * (1 - m)]]; this.did = d.id; } },
   activate() { this.q = null; }, 
@@ -2320,7 +2320,7 @@ const BRUSH_PRESETS = { round: { hardness: 80, flow: 100 }, soft: { hardness: 10
 const blendSel = (o) => OB.select('Blend', o, 'blend', BLEND_LIST);
 function paintTool(id, name, key, ic, mode, hint) {
   return {
-    id, name, key, icon: ic, hint, cursor: 'none', brushSize() { return O[id].size; },
+    id, name, shortcut: key, icon: ic, hint, cursor: 'none', brushSize() { return O[id].size; },
     options() {
       const o = O[id], out = [];
       if (id === 'brush') out.push(OB.select('Brush', o, 'type', [['round', 'Round'], ['soft', 'Soft'], ['hard', 'Hard'], ['airbrush', 'Airbrush'], ['texture', 'Texture (chalk)']], () => { Object.assign(o, BRUSH_PRESETS[o.type]); Tools.renderBar(); }));
@@ -2349,7 +2349,7 @@ Tools.register(paintTool('eraser', 'Eraser', 'e', 'eraser', 'erase', 'Erase to t
 function retouchTool(id, name, key, ic, kind, hint) {
   const src = kind === 'clone' || kind === 'heal';
   return {
-    id, name, key, icon: ic, hint, cursor: 'none', brushSize() { return O[id].size; },
+    id, name, shortcut: key, icon: ic, hint, cursor: 'none', brushSize() { return O[id].size; },
     options() {
       const o = O[id], out = [OB.range('Size', o, 'size', 1, 400, 1, 'px'), OB.range('Hardness', o, 'hardness', 0, 100, 1, '%')];
       if (src) out.push(OB.range('Opacity', o, 'opacity', 1, 100, 1, '%'), OB.check('Sample all layers', o, 'sampleAll'), h('span', { class: 'lbl', text: 'Alt-click to set source' })); else out.push(OB.range('Strength', o, 'strength', 1, 100, 1, '%'));
@@ -2412,7 +2412,7 @@ function openGradientEditor(onDone) {
   render();
 }
 Tools.register({
-  id: 'gradient', name: 'Gradient', key: 'g', icon: 'gradient', hint: 'Drag to fill the layer (or selection) with a gradient',
+  id: 'gradient', name: 'Gradient', shortcut: 'g', icon: 'gradient', hint: 'Drag to fill the layer (or selection) with a gradient',
   options() {
     const o = O.gradient, prev = h('button', { class: 'ctl', style: { width: '120px', height: '24px', background: gradCss(o.stops, o.reverse), padding: 0 }, 'data-tip': 'Edit gradient', onclick: () => openGradientEditor(() => Tools.renderBar()) });
     return [h('div', { class: 'opt' }, prev), OB.seg(o, 'type', [['linear', 'Linear'], ['radial', 'Radial'], ['reflected', 'Mirror']], () => Tools.renderBar()), OB.check('Reverse', o, 'reverse', () => Tools.renderBar()), OB.range('Opacity', o, 'opacity', 1, 100, 1, '%'), blendSel(o)];
@@ -2431,7 +2431,7 @@ Tools.register({
   cancel() { if (this.L) { this.L._stroke = null; this.L = null; } }
 });
 Tools.register({
-  id: 'bucket', name: 'Paint Bucket', key: 'shift+g', icon: 'bucket', hint: 'Click to fill similar-colored area with the foreground color',
+  id: 'bucket', name: 'Paint Bucket', shortcut: 'shift+g', icon: 'bucket', hint: 'Click to fill similar-colored area with the foreground color',
   options() { return [OB.range('Tolerance', O.bucket, 'tol', 0, 255), OB.check('Contiguous', O.bucket, 'contig'), OB.range('Opacity', O.bucket, 'opacity', 1, 100, 1, '%'), OB.check('Sample all layers', O.bucket, 'sampleAll')]; },
   down(p) {
     const t = Tools.paintTarget(); if (!t) return; if (t.toMask) { toast('Bucket fill works on pixel layers', 'warn'); return; }
@@ -2463,7 +2463,7 @@ const PathOps = {
   }
 };
 Tools.register({
-  id: 'pen', name: 'Pen', key: 'p', icon: 'pen', animated: false, hint: 'Click for corner points · drag for curves · click first point to close · Enter finishes · Backspace removes last point',
+  id: 'pen', name: 'Pen', shortcut: 'p', icon: 'pen', animated: false, hint: 'Click for corner points · drag for curves · click first point to close · Enter finishes · Backspace removes last point',
   options() { const d = () => App.doc, P = () => d() && PathOps.get(d()); return [OB.btn('Fill path', () => P() && PathOps.fill(d(), P()), 'Fill with foreground color'), OB.btn('Stroke path', () => P() && PathOps.stroke(d(), P()), 'Stroke with brush size/foreground'), OB.btn('To selection', () => P() && PathOps.toSelection(d(), P())), OB.btn('To shape layer', () => P() && PathOps.toShape(d(), P())), OB.btn('Finish', () => this.finish(), 'Enter')]; },
   cur(d) { return PathOps.get(d); },
   hit(p, P) {
@@ -2504,7 +2504,7 @@ Tools.register({
 
 /* ---------- text & shapes ---------- */
 const textTool = {
-  id: 'text', name: 'Text', key: 't', icon: 'text', cursor: 'text', hint: 'Click to add text · click existing text to edit it in the Properties panel',
+  id: 'text', name: 'Text', shortcut: 't', icon: 'text', cursor: 'text', hint: 'Click to add text · click existing text to edit it in the Properties panel',
   options() {
     const upd = (k, v) => { const L = App.doc && App.doc.active; if (L && L.type === 'text' && !L.locked) { L.props[k] = v; renderLayerContent(L); App.doc.invalidate(); clearTimeout(this._h); this._h = setTimeout(() => { Hist.commit('Edit Text'); Bus.emit('openprops'); }, 350); } };
     const o = O.text, col = h('input', { type: 'color', value: Color.fg }); col.oninput = () => { Color.set('fg', col.value); upd('color', col.value); };
@@ -2523,7 +2523,7 @@ Tools.register(textTool);
 function insertLayerSilently(d, L) { const f = d.activeId && d.find(d.activeId); if (f) f.arr.splice(f.i + 1, 0, L); else d.layers.push(L); d.activeId = L.id; d.selIds = new Set([L.id]); d.editMask = false; }
 function shapeTool(id, name, ic, key) {
   return {
-    id, name, key, icon: ic, hint: 'Drag to draw · Shift = proportional · Alt = from center · edit fill/stroke in the Properties panel',
+    id, name, shortcut: key, icon: ic, hint: 'Drag to draw · Shift = proportional · Alt = from center · edit fill/stroke in the Properties panel',
     options() {
       const o = O.shape, out = [];
       if (id === 'rect') out.push(OB.select('Shape', o, 'kind', [['rect', 'Rectangle'], ['rounded', 'Rounded Rectangle'], ['line', 'Line'], ['polygon', 'Polygon'], ['star', 'Star']], () => Tools.renderBar()));
@@ -2555,9 +2555,9 @@ function shapeTool(id, name, ic, key) {
 }
 Tools.register(shapeTool('rect', 'Rectangle', 'rect', 'u'));
 Tools.register(shapeTool('ellipse', 'Ellipse', 'ellipse', 'shift+u'));
-Tools.register({ id: 'hand', name: 'Hand', key: 'h', icon: 'hand', cursor: 'grab', hint: 'Drag to pan · hold Space with any tool for a temporary hand', options() { return [OB.btn('Fit on screen', () => View.fit()), OB.btn('100%', () => View.setZoom(1))]; } });
+Tools.register({ id: 'hand', name: 'Hand', shortcut: 'h', icon: 'hand', cursor: 'grab', hint: 'Drag to pan · hold Space with any tool for a temporary hand', options() { return [OB.btn('Fit on screen', () => View.fit()), OB.btn('100%', () => View.setZoom(1))]; } });
 Tools.register({
-  id: 'zoom', name: 'Zoom', key: 'z', icon: 'zoom', cursor: 'zoom-in', hint: 'Click to zoom in · Alt-click to zoom out · drag a box to zoom to an area',
+  id: 'zoom', name: 'Zoom', shortcut: 'z', icon: 'zoom', cursor: 'zoom-in', hint: 'Click to zoom in · Alt-click to zoom out · drag a box to zoom to an area',
   options() { return [OB.btn('Zoom in', () => View.zoomAt(1.5)), OB.btn('Zoom out', () => View.zoomAt(1 / 1.5)), OB.btn('Fit on screen', () => View.fit()), OB.btn('100%', () => View.setZoom(1))]; },
   down(p) { this.a = p; this.b = p; }, move(p) { this.b = p; },
   up(p) {
@@ -2569,7 +2569,7 @@ Tools.register({
   overlay(k) { if (!this.a || !this.b) return; k.save(); k.strokeStyle = '#fff'; k.setLineDash([4, 3]); k.strokeRect(this.a.sx, this.a.sy, this.b.sx - this.a.sx, this.b.sy - this.a.sy); k.restore(); }
 });
 Tools.register({
-  id: 'eyedropper', name: 'Eyedropper', key: 'i', icon: 'eyedropper', cursor: 'crosshair', hint: 'Click to pick the foreground color · Alt-click picks the background',
+  id: 'eyedropper', name: 'Eyedropper', shortcut: 'i', icon: 'eyedropper', cursor: 'crosshair', hint: 'Click to pick the foreground color · Alt-click picks the background',
   options() { return [OB.select('Sample', O.eyedropper, 'sample', [['image', 'All layers'], ['layer', 'Current layer']]), OB.select('Size', O.eyedropper, 'size', [[1, 'Point'], [3, '3×3 average'], [5, '5×5 average'], [11, '11×11 average']])]; },
   pick(p) {
     const d = App.doc, x = Math.floor(p.x), y = Math.floor(p.y); if (x < 0 || y < 0 || x >= d.w || y >= d.h) return; const n = +O.eyedropper.size, half = Math.floor(n / 2);
@@ -3198,7 +3198,7 @@ App.canvasMenu = e => {
 App.setAutosave = () => { clearInterval(App._at); const s = Prefs.get('autosave', 30); if (s > 0) App._at = setInterval(() => App.autosave(), s * 1000); };
 App.autosave = async () => { if (!Store.db) return; for (const d of App.docs) { if (!d.modified) continue; const sig = d.hist.idx + '|' + d.hist.states.length + '|' + (d.hist.states[d.hist.idx] || {}).time; if (d._autoSig === sig) continue; try { if (await Store.saveDoc(d, true)) { d._autoSig = sig; setStatus('Autosaved ' + new Date().toLocaleTimeString()); } } catch (e) { console.error('Autosave failed', e); } } };
 function initKeys() {
-  const lookup = {}; Tools.order.forEach(id => { const k = Tools.list[id].key; if (k) lookup[k] = id; });
+  const lookup = {}; Tools.order.forEach(id => { const k = Tools.list[id].shortcut; if (k) lookup[k] = id; });
   document.addEventListener('keydown', e => {
     const t = e.target, tag = (t.tagName || '').toLowerCase(), typing = (tag === 'input' && !['range', 'checkbox', 'color', 'button'].includes(t.type)) || tag === 'textarea' || tag === 'select' || t.isContentEditable;
     if (e.key === 'Escape') Menu.close();
@@ -3206,7 +3206,7 @@ function initKeys() {
     const k = e.key.toLowerCase(), ctrl = e.ctrlKey || e.metaKey, d = App.doc;
     if (e.key === ' ') { if (document.activeElement && document.activeElement.tagName === 'BUTTON') document.activeElement.blur(); if (!View.space) { View.space = true; View.updateCursor(); View.odirty(); } e.preventDefault(); return; }
     if (Transform.active) { if (e.key === 'Enter') { e.preventDefault(); Transform.commit(); return; } if (e.key === 'Escape') { e.preventDefault(); Transform.cancel(); return; } }
-    if (d && Tools.cur && Tools.cur.key && !ctrl && Tools.cur.key(e)) { e.preventDefault(); return; }
+    if (d && Tools.cur && typeof Tools.cur.key === 'function' && !ctrl && Tools.cur.key(e)) { e.preventDefault(); return; }
     if (e.altKey && !ctrl) { if (k === 't') { e.preventDefault(); Transform.start(); return; } if (k === 'n') { e.preventDefault(); newDocDialog(); return; } if (e.key === 'Backspace') { e.preventDefault(); EditOps.fill(Color.fg); return; } }
     if (ctrl) {
       const stop = () => e.preventDefault();
