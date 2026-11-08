@@ -297,6 +297,7 @@ input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;bac
     <span class="sp" id="statusMsg">Ready</span>
     <span id="statusDoc"></span>
     <span id="statusPos"></span>
+    <span id="statusPerf" data-tip="Render performance — click for details" style="cursor:pointer"></span>
     <span id="statusMem"></span>
     <span style="display:flex;align-items:center;gap:2px">
       <button id="zoomOut" data-tip="Zoom out (-)">−</button>
@@ -1631,10 +1632,14 @@ const FX = {
     if (!L || !L.canvas) { toast('Select a pixel, text or shape layer first', 'warn'); return; } if (L.locked) { toast('Layer is locked', 'warn'); return; }
     const c = L.canvas, k = cx2(c), backup = k.getImageData(0, 0, c.width, c.height), byId = this.byId;
     let cur = byId[startId] || this.list[0], form = null, closed = false, pending = false, live = true; const heavy = c.width * c.height > 8e6;
+    let token = 0;
+    const srcOf = () => new ImageData(new Uint8ClampedArray(backup.data), c.width, c.height);
     const preview = () => {
-      pending = false; const out = new ImageData(new Uint8ClampedArray(backup.data), c.width, c.height);
-      let r; try { r = cur.apply(out, form.values(), 1) || out; } catch (e) { console.error(e); toast('Filter error: ' + e.message, 'error'); return; }
-      selectionLerp(d, L, backup, r); k.putImageData(r, 0, 0); L.rev++; d.invalidate();
+      pending = false; const my = ++token, f = cur, vals = form.values();
+      Pix.render(f, srcOf(), 1, vals).then(r => {
+        if (closed || my !== token) return;
+        selectionLerp(d, L, backup, r); k.putImageData(r, 0, 0); L.rev++; d.invalidate(); Bus.emit('pixels');
+      }).catch(e => { if (closed) return; console.error(e); toast('Filter error: ' + e.message, 'error'); });
     };
     const sched = debounce(() => { if (live && !closed) preview(); }, 45);
     const side = h('div', { class: 'fxside' }), formBox = h('div'), title = h('h3', { style: { margin: '0 0 8px' } });
@@ -1662,17 +1667,183 @@ const FX = {
           grid.append(h('div', { class: 'fxcard', 'data-id': f.id, onclick: () => setCur(f) }, cv, h('div', { text: f.name })));
         });
       });
-      const next = () => { if (closed || !queue.length) return; const [f, cv] = queue.shift(); try { const o = new ImageData(new Uint8ClampedArray(tbase.data), tw, th), df = {}; f.fields.forEach(x => { df[x.key] = x.value; }); cx2(cv).putImageData(f.apply(o, df, 0.25) || o, 0, 0); } catch (e) { /* thumbnail only */ } setTimeout(next, 8); };
-      setTimeout(next, 30);
+      const paint = (cv, r) => { try { cx2(cv).putImageData(r, 0, 0); } catch (e) { /* thumbnail only */ } };
+      const next = () => {
+        if (closed || !queue.length) return;
+        const [f, cv] = queue.shift(), df = {}; f.fields.forEach(x => { df[x.key] = x.value; });
+        const tile = new ImageData(new Uint8ClampedArray(tbase.data), tw, th);
+        const sync = () => { try { paint(cv, f.apply(tile, df, 0.25) || tile); } catch (e) { /* thumbnail only */ } };
+        if (Pix.canOffload(f)) Pix.render(f, tile, 0.25, df).then(r => { paint(cv, r); next(); }).catch(() => { sync(); next(); });
+        else { sync(); setTimeout(next, 8); }
+      };
+      const lanes = clamp(Pix.workers.length || 1, 1, 4); for (let i = 0; i < lanes; i++) setTimeout(next, 30 + i * 4);
     }
     body.append(side);
     const dlg = Dialog.open({
       title: single ? cur.name : 'Filter Gallery', body, width: single ? 380 : 860, cls: single ? '' : 'wide',
-      buttons: [{ text: 'Cancel', onClick: c2 => c2(false) }, { text: 'Apply', primary: true, onClick: c2 => { if (pending || !live) preview(); closed = true; if (L.type === 'text' || L.type === 'shape') { L.type = 'raster'; L.props = null; } Hist.commit(cur.name); c2(true); } }],
+      buttons: [{ text: 'Cancel', onClick: c2 => c2(false) }, { text: 'Apply', primary: true, onClick: c2 => {
+        const f = cur, vals = form.values(); closed = true; token++;
+        Pix.render(f, srcOf(), 1, vals).then(r => {
+          selectionLerp(d, L, backup, r); k.putImageData(r, 0, 0); L.rev++; d.invalidate(); Bus.emit('pixels');
+          if (L.type === 'text' || L.type === 'shape') { L.type = 'raster'; L.props = null; }
+          Hist.commit(f.name); c2(true);
+        }).catch(e => { console.error(e); k.putImageData(backup, 0, 0); L.rev++; d.invalidate(); toast('Filter error: ' + e.message, 'error'); c2(false); });
+      } }],
       onClose: r => { closed = true; if (r !== true) { k.putImageData(backup, 0, 0); L.rev++; d.invalidate(); } }
     });
     setCur(cur); return dlg;
   }
+};
+
+/* =====================================================================
+   BACKGROUND PIXEL ENGINE
+   Filter kernels run in a pool of Web Workers so heavy filters never
+   block the UI. The worker source is generated at runtime from the very
+   same kernel functions the main thread uses (Function.prototype.toString),
+   so the two paths cannot drift apart. Wide images are split into slabs
+   (with a halo margin for shift-invariant kernels) and spread across the
+   pool. Every call falls back to the main thread when workers are
+   unavailable, disabled in Preferences, or fail at runtime.
+   ===================================================================== */
+const PIX_NO_WORKER = { perspective: 1 };   /* kernels that need a canvas element */
+const PIX_TILEABLE = {                      /* shift-invariant kernels -> halo margin in px */
+  gaussian: (p, s) => Math.ceil(3 * p.radius * s) + 2,
+  unsharp: (p, s) => Math.ceil(3 * p.radius * s) + 2,
+  glow: (p, s) => Math.ceil(3 * p.radius * s) + 2,
+  motion: (p, s) => Math.ceil(Math.abs(p.distance * s)) + 2,
+  cartoon: (p, s) => Math.ceil(3 * p.smooth * s) + 3,
+  sharpen: () => 2, emboss: () => 2, edges: () => 2, bw: () => 0, cinematic: () => 0
+};
+const Pix = {
+  workers: [], idle: [], queue: [], jobs: new Map(), seq: 0, url: null,
+  enabled: true, broken: false, reason: '', maxWorkers: 4, timeout: 20000,
+  stats: { jobs: 0, off: 0, sync: 0, ms: 0, errors: 0 },
+  /* Pure functions a kernel may call. They must never touch the DOM.
+     Keyed by name because an arrow function's source has no name of its own. */
+  helpers() { return { clamp, hexToRgb, lumOf, boxesForGauss, boxLine, blurFloat, blurRGBA, sobel, shadowAlpha, morphMask, fxVignette, fxGrain }; },
+  kernels() { return FX.list.filter(f => typeof f.apply === 'function' && !PIX_NO_WORKER[f.id]); },
+  source() {
+    const H = Object.entries(this.helpers()).map(([n, f]) => `const ${n} = ${f.toString()};`).join('\n');
+    const K = this.kernels().map(f => `KERN[${JSON.stringify(f.id)}] = ({${f.apply.toString()}}).apply;`).join('\n');
+    return `'use strict';
+const KERN = {};
+${H}
+${K}
+self.onmessage = function (e) {
+  const m = e.data, id = m.id;
+  try {
+    const fn = KERN[m.op];
+    if (!fn) throw new Error('no kernel registered for ' + m.op);
+    const img = new ImageData(new Uint8ClampedArray(m.buf), m.w, m.h);
+    const out = fn(img, m.p, m.s) || img, od = out.data;
+    const ab = od.buffer.slice(od.byteOffset, od.byteOffset + od.byteLength);
+    self.postMessage({ id: id, buf: ab, len: od.length }, [ab]);
+  } catch (err) {
+    self.postMessage({ id: id, op: m.op, error: String((err && err.message) || err) });
+  }
+};
+self.postMessage({ ready: true });`;
+  },
+  init() {
+    this.enabled = Prefs.get('workers', true);
+    if (!this.enabled) { this.reason = 'disabled in Preferences'; return; }
+    try {
+      if (typeof Worker !== 'function' || typeof Blob !== 'function' || typeof URL === 'undefined' || !URL.createObjectURL) throw new Error('Web Workers are not available');
+      this.url = URL.createObjectURL(new Blob([this.source()], { type: 'text/javascript' }));
+      const n = clamp((navigator.hardwareConcurrency || 2) - 1, 1, this.maxWorkers);
+      for (let i = 0; i < n; i++) this.spawn();
+    } catch (e) { this.broken = true; this.reason = (e && e.message) || String(e); this.workers = []; }
+  },
+  spawn() {
+    const wk = new Worker(this.url);
+    wk.busy = false;
+    wk.onmessage = e => this.onResult(wk, e.data);
+    wk.onerror = ev => { this.broken = true; this.reason = (ev && ev.message) || 'worker error'; this.retire(wk); };
+    this.workers.push(wk); this.idle.push(wk); return wk;
+  },
+  retire(wk) {
+    for (const arr of [this.workers, this.idle]) { const i = arr.indexOf(wk); if (i >= 0) arr.splice(i, 1); }
+    try { wk.terminate(); } catch (e) { /* already gone */ }
+    if (this.url && this.workers.length < 1 && this.enabled && !this.broken) { try { this.spawn(); } catch (e) { /* give up */ } }
+  },
+  onResult(wk, r) {
+    if (!r || r.ready) return;
+    clearTimeout(wk.watch);
+    const cb = this.jobs.get(r.id); this.jobs.delete(r.id);
+    wk.busy = false; this.idle.push(wk); this.stats.jobs++;
+    if (r.error) { this.stats.errors++; if (r.op) PIX_NO_WORKER[r.op] = 1; }
+    if (cb) cb(r);
+    this.pump();
+  },
+  pump() {
+    while (this.queue.length && this.idle.length) {
+      const msg = this.queue.shift(), wk = this.idle.pop();
+      wk.busy = true;
+      wk.watch = setTimeout(() => {
+        const cb = this.jobs.get(msg.id); this.jobs.delete(msg.id);
+        this.stats.errors++; this.retire(wk);
+        if (cb) cb({ id: msg.id, op: msg.op, error: 'worker timed out' });
+        this.pump();
+      }, this.timeout);
+      try { wk.postMessage(msg, [msg.buf]); } catch (e) {
+        clearTimeout(wk.watch); wk.busy = false; this.idle.push(wk);
+        const cb = this.jobs.get(msg.id); this.jobs.delete(msg.id);
+        if (cb) cb({ id: msg.id, op: msg.op, error: (e && e.message) || 'postMessage failed' });
+      }
+    }
+  },
+  canOffload(f) { return !!f && this.workers.length > 0 && !PIX_NO_WORKER[f.id]; },
+  label() { return this.workers.length ? `${this.workers.length} worker${this.workers.length > 1 ? 's' : ''}` : 'main thread'; },
+  job(op, p, s, u8, w, h) {
+    return new Promise((resolve, reject) => {
+      if (!this.workers.length) { reject(new Error('no worker available')); return; }
+      const id = ++this.seq, buf = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+      this.jobs.set(id, r => { if (r.error) reject(new Error(r.error)); else resolve(new Uint8ClampedArray(r.buf, 0, r.len)); });
+      this.queue.push({ id, op, p, s, w, h, buf });
+      this.pump();
+    });
+  },
+  params(f, over) { const p = {}; (f.fields || []).forEach(x => { p[x.key] = x.value; }); return over ? Object.assign(p, over) : p; },
+  marginOf(f, p, s) { const m = PIX_TILEABLE[f.id]; return m ? Math.max(0, Math.round(m(p, s))) : -1; },
+  /* Main entry point: always resolves to an ImageData, on or off the main thread. */
+  async render(f, src, s, params) {
+    const p = params || this.params(f);
+    if (!this.canOffload(f)) return this.renderSync(f, src, s, p);
+    const margin = this.marginOf(f, p, s);
+    if (margin < 0 || src.height < 96 || this.workers.length < 2) return this.renderWhole(f, src, s, p);
+    return this.renderTiled(f, src, s, p, margin);
+  },
+  async renderWhole(f, src, s, p) {
+    try {
+      const t0 = performance.now(), out = await this.job(f.id, p, s, new Uint8ClampedArray(src.data), src.width, src.height);
+      this.stats.off++; this.stats.ms += performance.now() - t0;
+      return new ImageData(out, src.width, src.height);
+    } catch (e) { return this.renderSync(f, src, s, p); }
+  },
+  async renderTiled(f, src, s, p, margin) {
+    const w = src.width, h = src.height, parts = Math.min(this.workers.length, Math.max(2, Math.ceil(h / 64)));
+    const rows = Math.ceil(h / parts), out = new Uint8ClampedArray(src.data), t0 = performance.now(), jobs = [];
+    for (let i = 0; i < parts; i++) {
+      const y0 = i * rows; if (y0 >= h) break;
+      const y1 = Math.min(h, y0 + rows), sy0 = Math.max(0, y0 - margin), sy1 = Math.min(h, y1 + margin), th = sy1 - sy0;
+      const chunk = new Uint8ClampedArray(w * th * 4);
+      for (let y = sy0; y < sy1; y++) chunk.set(src.data.subarray(y * w * 4, (y + 1) * w * 4), (y - sy0) * w * 4);
+      jobs.push(this.job(f.id, p, s, chunk, w, th).then(res => {
+        const top = y0 - sy0;
+        for (let y = 0; y < y1 - y0; y++) out.set(res.subarray((top + y) * w * 4, (top + y + 1) * w * 4), (y0 + y) * w * 4);
+      }));
+    }
+    try {
+      await Promise.all(jobs); this.stats.off++; this.stats.ms += performance.now() - t0;
+      return new ImageData(out, w, h);
+    } catch (e) { return this.renderSync(f, src, s, p); }
+  },
+  renderSync(f, src, s, params) {
+    const t0 = performance.now(), copy = new ImageData(new Uint8ClampedArray(src.data), src.width, src.height);
+    try { return f.apply(copy, params || this.params(f), s) || copy; }
+    finally { this.stats.sync++; this.stats.ms += performance.now() - t0; }
+  },
+  dispose() { this.queue.length = 0; this.jobs.clear(); this.workers.slice().forEach(w => { clearTimeout(w.watch); try { w.terminate(); } catch (e) { /* ignore */ } }); this.workers = []; this.idle = []; }
 };
 
 /* =====================================================================
@@ -1696,6 +1867,7 @@ function drawAnts(k, sel, d, phase) {
 }
 const View = {
   W: 0, H: 0, dpr: 1, _d: true, _o: true, phase: 0, lastAnt: 0, mouse: null, space: false, drag: null, showGrid: false, showGuides: true, rulers: true, snap: true, gridSize: 50, sg: [],
+  perf: { ms: 0, fps: 0, frames: 0, mark: 0 },
   init() {
     this.cv = $('#view'); this.ov = $('#overlay'); this.vk = this.cv.getContext('2d'); this.ok = this.ov.getContext('2d'); this.rh = $('#rulerH'); this.rv = $('#rulerV');
     const c = mkCanvas(16, 16), k = c.getContext('2d'); k.fillStyle = '#ffffff'; k.fillRect(0, 0, 16, 16); k.fillStyle = '#c9c9c9'; k.fillRect(0, 0, 8, 8); k.fillRect(8, 8, 8, 8); this.checker = this.vk.createPattern(c, 'repeat');
@@ -1736,7 +1908,7 @@ const View = {
     ov.addEventListener('contextmenu', e => { e.preventDefault(); if (App.canvasMenu) App.canvasMenu(e); });
     ov.addEventListener('dblclick', e => { if (App.doc && Tools.cur && Tools.cur.dblclick) Tools.cur.dblclick(this.pt(e)); });
     const gs = o => e => this.guideStart(e, o); this.rh.addEventListener('pointerdown', gs('h')); this.rv.addEventListener('pointerdown', gs('v'));
-    $('#zoomOut').onclick = () => this.zoomAt(1 / 1.25); $('#zoomIn').onclick = () => this.zoomAt(1.25); $('#zoomFit').onclick = () => this.fit();
+    $('#zoomOut').onclick = () => this.zoomAt(1 / 1.25); $('#zoomIn').onclick = () => this.zoomAt(1.25); $('#zoomFit').onclick = () => this.fit(); $('#statusPerf').onclick = () => perfDialog();
     $('#zoomVal').addEventListener('change', e => { const v = parseFloat(e.target.value); if (v > 0) this.setZoom(v / 100); else this.updateStatus(); });
     Bus.on('view', () => this.updateStatus()); Bus.on('doc', () => this.updateStatus()); Bus.on('layers', () => this.updateStatus());
   },
@@ -1784,9 +1956,14 @@ const View = {
     requestAnimationFrame(tt => this.loop(tt));
     const d = App.doc;
     if (d && (d.selection || (Tools.cur && Tools.cur.animated)) && t - this.lastAnt > 120) { this.phase = (this.phase + 1) % 8; this.lastAnt = t; if (!d.selection || d.selection.runs.n < 25000) this._o = true; }
+    const t0 = performance.now();
     if (this._d) { try { this.drawView(); this.drawRulers(); } catch (e) { console.error(e); } }
     if (this._o) { try { this.drawOverlay(); } catch (e) { console.error(e); } }
+    const P = this.perf, work = performance.now() - t0; P.frames++;
+    if (work > 0) P.ms += (work - P.ms) * 0.2;
+    if (t - P.mark > 500) { P.fps = Math.round(P.frames * 1000 / (t - P.mark)); P.frames = 0; P.mark = t; this.updatePerf(); }
   },
+  updatePerf() { const el = $('#statusPerf'); if (el) el.textContent = App.doc ? `${this.perf.ms.toFixed(1)} ms · ${this.perf.fps} fps · ⚙ ${Pix.label()}` : `⚙ ${Pix.label()}`; },
   drawView() {
     this._d = false; const k = this.vk, W = this.W, H = this.H; k.setTransform(this.dpr, 0, 0, this.dpr, 0, 0); k.globalCompositeOperation = 'source-over'; k.fillStyle = '#17181b'; k.fillRect(0, 0, W, H);
     const d = App.doc; if (!d) return; const z = d.zoom, x0 = d.px, y0 = d.py, dw = d.w * z, dh = d.h * z;
@@ -2588,7 +2765,7 @@ Tools.register({
 ICONS.eyedropper = '<path d="M4 20l1-4 9-9 3 3-9 9z"/><path d="M14 7l3-3 3 3-3 3M13 8l3 3"/>';
 const typeIcon = L => ({ raster: 'img', text: 'text', shape: 'shape', adjustment: 'adj', group: 'folder' })[L.type] || 'img';
 const Panels = {
-  defs: {}, els: {}, tabs: {}, built: {}, docks: { top: ['properties', 'color', 'swatches', 'adjust', 'navigator', 'ai'], bottom: ['layers', 'channels', 'paths', 'history'] },
+  defs: {}, els: {}, tabs: {}, built: {}, docks: { top: ['properties', 'color', 'swatches', 'adjust', 'histogram', 'navigator', 'ai'], bottom: ['layers', 'channels', 'paths', 'history'] },
   register(n, def) { this.defs[n] = def; },
   dockOf(n) { return this.docks.top.includes(n) ? 'top' : 'bottom'; },
   init() {
@@ -2830,6 +3007,69 @@ const NavPanel = {
   }
 };
 Panels.register('navigator', { title: 'Navigator', build: el => NavPanel.build(el), update: () => NavPanel.update() });
+
+/* ---------- Histogram ---------- */
+const Histogram = {
+  ui: {}, bins: null, sig: '', tmp: null, mode: 'rgb', log: true, source: 'composite',
+  build(el) {
+    el.classList.add('nopad');
+    this.ui.cv = h('canvas', { width: 256, height: 104, style: { width: '100%', height: '104px', display: 'block', background: '#101114', borderRadius: '4px' } });
+    this.ui.stats = h('div', { class: 'fld-info', style: { marginTop: '6px', minHeight: '26px' } });
+    const seg = (key, items) => OB.seg(this, key, items, () => { this.sig = ''; this.update(); });
+    el.append(h('div', { style: { padding: '8px' } },
+      h('div', { class: 'row', style: { gap: '4px', marginBottom: '6px' } }, seg('mode', [['rgb', 'RGB'], ['luma', 'Luma'], ['r', 'R'], ['g', 'G'], ['b', 'B']])),
+      h('div', { class: 'row', style: { gap: '4px', marginBottom: '8px' } }, seg('source', [['composite', 'Composite'], ['layer', 'Layer']]), seg('log', [[true, 'Log'], [false, 'Linear']])),
+      this.ui.cv, this.ui.stats));
+  },
+  signature(d) { let s = d.id + '|' + d.hist.idx + '|' + this.source + '|' + (d.active ? d.active.id : '-'); d.walk(L => { s += ';' + L.rev + ',' + (L.mrev || 0); }); return s; },
+  compute(d) {
+    const src = (this.source === 'layer' && d.active && d.active.canvas) ? d.active.canvas : d.getComposite();
+    const s = Math.min(1, 192 / Math.max(d.w, d.h)), w = Math.max(1, Math.round(d.w * s)), hh = Math.max(1, Math.round(d.h * s));
+    if (!this.tmp || this.tmp.width !== w || this.tmp.height !== hh) this.tmp = mkCanvas(w, hh);
+    const k = cx2(this.tmp); k.setTransform(1, 0, 0, 1, 0, 0); k.clearRect(0, 0, w, hh); k.drawImage(src, 0, 0, w, hh);
+    const px = k.getImageData(0, 0, w, hh).data, bins = new Uint32Array(1024);
+    for (let i = 0; i < px.length; i += 4) {
+      if (!px[i + 3]) continue;                                   /* skip fully transparent pixels */
+      const r = px[i], g = px[i + 1], b = px[i + 2];
+      bins[r]++; bins[256 + g]++; bins[512 + b]++; bins[768 + ((r * 77 + g * 151 + b * 28) >> 8)]++;
+    }
+    return bins;
+  },
+  draw() {
+    const cv = this.ui.cv, k = cx2(cv), W = cv.width, H = cv.height, bins = this.bins;
+    k.setTransform(1, 0, 0, 1, 0, 0); k.clearRect(0, 0, W, H);
+    const chans = this.mode === 'rgb' ? [0, 1, 2] : this.mode === 'luma' ? [3] : [{ r: 0, g: 1, b: 2 }[this.mode]];
+    const cols = ['rgba(255,80,80,.75)', 'rgba(90,225,90,.75)', 'rgba(90,145,255,.75)', 'rgba(215,215,215,.8)'];
+    let peak = 1;
+    for (const c of chans) for (let i = 0; i < 256; i++) { const v = bins[c * 256 + i], lv = this.log ? Math.log1p(v) : v; if (lv > peak) peak = lv; }
+    k.globalCompositeOperation = 'lighter';
+    for (const c of chans) {
+      k.beginPath(); k.moveTo(0, H);
+      for (let i = 0; i < 256; i++) { const v = bins[c * 256 + i], lv = this.log ? Math.log1p(v) : v; k.lineTo(i * W / 255, H - Math.min(1, lv / peak) * (H - 3)); }
+      k.lineTo(W, H); k.closePath(); k.fillStyle = this.mode === 'luma' ? cols[3] : cols[c]; k.fill();
+    }
+    k.globalCompositeOperation = 'source-over';
+    k.strokeStyle = 'rgba(255,255,255,.09)'; k.lineWidth = 1; k.beginPath();
+    for (let i = 1; i < 4; i++) { const x = Math.round(W * i / 4) + .5; k.moveTo(x, 0); k.lineTo(x, H); } k.stroke();
+  },
+  stats() {
+    const ch = this.mode === 'r' ? 0 : this.mode === 'g' ? 1 : this.mode === 'b' ? 2 : 3, B = this.bins.subarray(ch * 256, ch * 256 + 256);
+    let n = 0, sum = 0, sum2 = 0, lo = -1, hi = -1, acc = 0, med = 0;
+    for (let i = 0; i < 256; i++) { const v = B[i]; if (!v) continue; n += v; sum += i * v; sum2 += i * i * v; if (lo < 0) lo = i; hi = i; acc += v; if (!med && acc >= n / 2) med = i; }
+    if (!n) { this.ui.stats.textContent = 'Nothing to measure — the layer is empty.'; return; }
+    const mean = sum / n, sd = Math.sqrt(Math.max(0, sum2 / n - mean * mean));
+    this.ui.stats.textContent = `mean ${mean.toFixed(1)} · σ ${sd.toFixed(1)} · median ${med} · range ${lo}–${hi} · clipped ${(B[0] / n * 100).toFixed(1)}% / ${(B[255] / n * 100).toFixed(1)}%`;
+  },
+  update() {
+    if (!this.ui.cv) return;
+    const d = App.doc;
+    if (!d) { this.bins = null; this.sig = ''; const k = cx2(this.ui.cv); k.setTransform(1, 0, 0, 1, 0, 0); k.clearRect(0, 0, this.ui.cv.width, this.ui.cv.height); this.ui.stats.textContent = 'No document open.'; return; }
+    const sig = this.signature(d);
+    if (sig !== this.sig || !this.bins) { this.bins = this.compute(d); this.sig = sig; }
+    this.draw(); this.stats();
+  }
+};
+Panels.register('histogram', { title: 'Histogram', build: el => Histogram.build(el), update: () => Histogram.update() });
 
 /* ---------- Channels ---------- */
 const ChannelsPanel = {
@@ -3081,15 +3321,43 @@ function canvasSizeDialog() {
 }
 function radiusDialog(title, fn, def = 5, max = 200) { const d = needDoc(); if (!d) return; if (!d.selection) { toast('Make a selection first', 'warn'); return; } Dialog.form({ title, ok: 'OK', width: 360, fields: [{ key: 'r', label: 'Radius (px)', type: 'range', min: 1, max, value: def }], onOk: v => { Progress.run(title + '…', async () => d.setSelection(fn(d.selection, v.r), title)); } }); }
 function prefsDialog() {
-  Dialog.form({ title: 'Preferences', ok: 'Save', fields: [{ key: 'grid', label: 'Grid spacing (px)', type: 'number', min: 2, max: 1000, value: View.gridSize }, { key: 'auto', label: 'Autosave interval', type: 'select', value: String(Prefs.get('autosave', 30)), options: [['0', 'Off'], ['15', '15 s'], ['30', '30 s'], ['60', '1 min'], ['120', '2 min']] }, { key: 'info', type: 'info', label: 'Autosave stores modified documents in browser storage (IndexedDB) so they can be recovered from the Welcome screen.' }],
-    onOk: v => { View.gridSize = clamp(Math.round(v.grid) || 50, 2, 1000); Prefs.set('grid', View.gridSize); Prefs.set('autosave', +v.auto); App.setAutosave(); View.dirty(); } });
+  Dialog.form({ title: 'Preferences', ok: 'Save', fields: [{ key: 'grid', label: 'Grid spacing (px)', type: 'number', min: 2, max: 1000, value: View.gridSize }, { key: 'auto', label: 'Autosave interval', type: 'select', value: String(Prefs.get('autosave', 30)), options: [['0', 'Off'], ['15', '15 s'], ['30', '30 s'], ['60', '1 min'], ['120', '2 min']] }, { key: 'workers', label: 'Run filters in background workers', type: 'checkbox', value: Prefs.get('workers', true) }, { key: 'info', type: 'info', label: 'Autosave stores modified documents in browser storage (IndexedDB) so they can be recovered from the Welcome screen. Filters run in a Web Worker pool; turn workers off to process them on the main thread instead.' }],
+    onOk: v => {
+      View.gridSize = clamp(Math.round(v.grid) || 50, 2, 1000); Prefs.set('grid', View.gridSize); Prefs.set('autosave', +v.auto); App.setAutosave(); View.dirty();
+      const w = !!v.workers; Prefs.set('workers', w);
+      if (w !== Pix.enabled || (w && !Pix.workers.length)) { Pix.dispose(); Pix.enabled = w; Pix.broken = false; Pix.reason = ''; Pix.init(); }
+      View.updatePerf(); toast('Filter engine: ' + Pix.label(), 'ok');
+    } });
+}
+function perfDialog() {
+  const d = App.doc, P = View.perf || { ms: 0, fps: 0 }, mem = (performance.memory && performance.memory.usedJSHeapSize)
+    ? (performance.memory.usedJSHeapSize / 1048576).toFixed(1) + ' MB JS heap' : 'heap size not exposed by this browser';
+  const avg = (Pix.stats.off + Pix.stats.sync) ? (Pix.stats.ms / (Pix.stats.off + Pix.stats.sync)).toFixed(1) : '0';
+  let layers = 0; if (d) d.walk(() => { layers++; });
+  const rows = [
+    ['Filter engine', Pix.workers.length ? Pix.workers.length + ' Web Worker(s) · ' + Pix.kernels().length + ' kernels' : 'main thread (fallback)'],
+    ['Worker status', Pix.broken ? 'unavailable — ' + Pix.reason : (Pix.workers.length ? 'running' : 'disabled in Preferences')],
+    ['Jobs offloaded / on main thread', Pix.stats.off + ' / ' + Pix.stats.sync + (Pix.stats.errors ? ' · ' + Pix.stats.errors + ' recovered' : '')],
+    ['Average filter time', avg + ' ms'],
+    ['Viewport render', P.ms.toFixed(1) + ' ms/frame · ' + P.fps + ' fps'],
+    ['Document', d ? d.name + ' — ' + d.w + '×' + d.h + ' (' + (d.w * d.h / 1e6).toFixed(1) + ' MP) · ' + layers + ' layer(s)' : 'none open'],
+    ['Device pixel ratio', String(window.devicePixelRatio || 1)],
+    ['Hardware concurrency', String(navigator.hardwareConcurrency || 'unknown')],
+    ['Memory', mem]
+  ];
+  Dialog.open({
+    title: 'Performance', width: 560,
+    body: [h('div', { class: 'kbd' }, rows.map(([k, v]) => h('div', {}, h('span', { text: k }), h('kbd', { text: v })))),
+      h('p', { class: 'fld-info', text: 'Filters run off the main thread in a worker pool. Wide images are split into horizontal slabs (with a halo margin so blurs stay seamless) and processed in parallel. If a worker fails or times out, the filter re-runs on the main thread automatically — the result is identical, only slower.' })],
+    buttons: [{ text: 'Restart workers', onClick: c => { Pix.dispose(); Pix.broken = false; Pix.reason = ''; Pix.init(); View.updatePerf(); toast('Filter engine: ' + Pix.label(), 'ok'); c(false); } }, { text: 'Close', primary: true, value: true }]
+  });
 }
 function shortcutsDialog() {
   const rows = [['Ctrl+O', 'Open image'], ['Ctrl+S', 'Save project'], ['Ctrl+Shift+S', 'Export'], ['Ctrl+Z', 'Undo'], ['Ctrl+Y / Ctrl+Shift+Z', 'Redo'], ['Ctrl+J', 'Duplicate layer'], ['Ctrl+T / Alt+T', 'Free transform'], ['Ctrl+N / Alt+N', 'New document'], ['Ctrl+A / Ctrl+D', 'Select all / deselect'], ['Ctrl+Shift+I', 'Invert selection'], ['Ctrl+G / +Shift', 'Group / ungroup'], ['Ctrl+E', 'Merge down'], ['Ctrl+C / X / V', 'Copy / cut / paste'], ['Delete', 'Clear selection'], ['Alt+Backspace', 'Fill foreground'], ['Ctrl+Backspace', 'Fill background'],
     ['V', 'Move'], ['M', 'Marquee'], ['L / Shift+L', 'Lasso / polygonal'], ['W / Shift+W', 'Magic wand / object'], ['C / Shift+C', 'Crop / perspective crop'], ['B / N / E', 'Brush / pencil / eraser'], ['S / J', 'Clone / heal'], ['R / Shift+R', 'Blur / sharpen'], ['G / Shift+G', 'Gradient / bucket'], ['P', 'Pen'], ['T', 'Text'], ['U / Shift+U', 'Rectangle / ellipse'], ['I', 'Eyedropper'], ['H / Z', 'Hand / zoom'], ['Space (hold)', 'Temporary hand'], ['+ / −', 'Zoom in / out'], ['Ctrl+0 / Ctrl+1', 'Fit / 100%'], ['[ / ]', 'Brush size'], ['X / D', 'Swap / default colors'], ['Enter / Esc', 'Apply / cancel transform, crop']];
   Dialog.open({ title: 'Keyboard Shortcuts', width: 640, body: [h('div', { class: 'kbd' }, rows.map(([k, v]) => h('div', {}, h('span', { text: v }), h('kbd', { text: k })))), h('p', { class: 'fld-info', text: 'Browsers reserve some Ctrl combinations (Ctrl+N, Ctrl+T, Ctrl+W). If yours does not respond, use the Alt+N / Alt+T alternatives or the menus.' })], buttons: [{ text: 'Close', primary: true, value: true }] });
 }
-function aboutDialog() { Dialog.open({ title: 'About Photo Studio Pro Ultimate', width: 480, body: [h('p', { class: 'msg', html: 'A single-file, offline-capable raster editor built with vanilla JavaScript, Canvas 2D and IndexedDB.' }), h('p', { class: 'fld-info', html: '<b>Honest scope notes:</b><br>• RGB 8-bit only (no CMYK/16-bit/ICC).<br>• Projects use the custom <code>.pspro</code> JSON format — Photoshop PSD is <b>not</b> supported.<br>• Filters run on the main thread; the UI shows a progress indicator for heavy operations.<br>• AI features are integration points that require your own external service and API key.<br>• Object Selection is a color-difference algorithm, not machine learning.' })], buttons: [{ text: 'OK', primary: true, value: true }] }); }
+function aboutDialog() { Dialog.open({ title: 'About Photo Studio Pro Ultimate', width: 480, body: [h('p', { class: 'msg', html: 'A single-file, offline-capable raster editor built with vanilla JavaScript, Canvas 2D and IndexedDB.' }), h('p', { class: 'fld-info', html: '<b>Honest scope notes:</b><br>• RGB 8-bit only (no CMYK/16-bit/ICC).<br>• Projects use the custom <code>.pspro</code> JSON format — Photoshop PSD is <b>not</b> supported.<br>• Filters run in a background Web Worker pool (Help ▸ Performance…) and fall back to the main thread automatically if workers are unavailable.<br>• AI features are integration points that require your own external service and API key.<br>• Object Selection is a color-difference algorithm, not machine learning.' })], buttons: [{ text: 'OK', primary: true, value: true }] }); }
 
 /* =====================================================================
    WELCOME / TUTORIAL
@@ -3175,7 +3443,7 @@ function menuDefs() {
       { label: 'Rulers', checked: View.rulers, action: () => { View.rulers = !View.rulers; $('#app').classList.toggle('nor', !View.rulers); Prefs.set('rulers', View.rulers); setTimeout(() => View.resize(), 20); } }, { label: 'Grid', checked: View.showGrid, action: () => { View.showGrid = !View.showGrid; Prefs.set('grid-on', View.showGrid); View.dirty(); } }, { label: 'Guides', checked: View.showGuides, action: () => { View.showGuides = !View.showGuides; View.dirty(); } }, { label: 'Snap & Smart Guides', checked: View.snap, action: () => { View.snap = !View.snap; } },
       { label: 'Add Guide…', action: D(x => Dialog.form({ title: 'New Guide', ok: 'Add', width: 340, fields: [{ key: 'o', label: 'Orientation', type: 'select', value: 'v', options: [['v', 'Vertical'], ['h', 'Horizontal']] }, { key: 'pos', label: 'Position (px)', type: 'number', min: 0, max: 100000, value: Math.round(x.w / 2) }], onOk: v => { x.guides.push({ o: v.o, pos: Math.round(v.pos) }); View.dirty(); } })) }, { label: 'Clear Guides', action: D(x => { x.guides = []; View.dirty(); }) }],
     Window: () => [...['properties', 'color', 'swatches', 'adjust', 'navigator', 'ai', 'layers', 'channels', 'paths', 'history'].map(n => ({ label: Panels.defs[n].title, checked: Panels.visible(n), action: () => Panels.show(n) })), 'sep', { label: 'Toggle Side Panels', action: () => { const s = $('#sidebar'), hide = s.style.display !== 'none'; s.style.display = hide ? 'none' : ''; $('#resizeV').style.display = hide ? 'none' : ''; setTimeout(() => View.resize(), 20); } }, { label: 'Reset Panel Sizes', action: () => { Prefs.set('sbw', 310); Prefs.set('dth', 330); $('#sidebar').style.setProperty('--sbw', '310px'); $('#dockTop').style.setProperty('--dth', '330px'); } }],
-    Help: () => [{ label: 'Welcome Screen', action: () => Welcome.show() }, { label: 'Interactive Tutorial', action: () => Tutorial.start() }, { label: 'Keyboard Shortcuts', action: shortcutsDialog }, 'sep', { label: 'AI Service Settings…', action: () => AI.settings() }, 'sep', { label: 'About / Limitations', action: aboutDialog }]
+    Help: () => [{ label: 'Welcome Screen', action: () => Welcome.show() }, { label: 'Interactive Tutorial', action: () => Tutorial.start() }, { label: 'Keyboard Shortcuts', action: shortcutsDialog }, { label: 'Performance…', action: () => perfDialog() }, 'sep', { label: 'AI Service Settings…', action: () => AI.settings() }, 'sep', { label: 'About / Limitations', action: aboutDialog }]
   };
 }
 function buildMenubar() {
@@ -3256,16 +3524,24 @@ function emptyState() {
 function boot() {
   Prefs.load(); const so = Prefs.get('opts'); if (so) for (const k in O) if (so[k] && typeof so[k] === 'object' && !Array.isArray(so[k])) { const keep = { ...O[k] }; Object.assign(O[k], so[k]); if (k === 'gradient' && !Array.isArray(O[k].stops)) O[k].stops = keep.stops; }
   View.gridSize = Prefs.get('grid', 50); View.showGrid = Prefs.get('grid-on', false); View.rulers = Prefs.get('rulers', true); $('#app').classList.toggle('nor', !View.rulers);
-  Tip.init(); buildMenubar(); Tools.buildToolbar(); Panels.init(); View.init(); initResizers(); initKeys(); initIO(); emptyState(); setDynamicGradient(); updateSwatchBox();
+  Tip.init(); Pix.init(); buildMenubar(); Tools.buildToolbar(); Panels.init(); View.init(); initResizers(); initKeys(); initIO(); emptyState(); setDynamicGradient(); updateSwatchBox();
   $('#fgSw').onclick = () => { Color.editing = 'fg'; Panels.show('color'); }; $('#bgSw').onclick = () => { Color.editing = 'bg'; Panels.show('color'); }; $('#swapBtn').onclick = () => Color.swap(); $('#defBtn').onclick = () => Color.reset();
   Bus.on('color', () => { updateSwatchBox(); if (O.gradient.dynamic) { setDynamicGradient(); if (Tools.curId === 'gradient') Tools.renderBar(); } Panels.refresh('color'); });
   Bus.on('doc', () => { $('#emptyState').classList.toggle('on', !App.doc); Panels.refreshAll(); });
   Bus.on('layers', () => { Panels.refresh('layers'); Panels.refresh('properties'); });
   Bus.on('history', () => Panels.refresh('history')); Bus.on('paths', () => { Panels.refresh('paths'); View.odirty(); }); Bus.on('selection', () => { Panels.refresh('channels'); View.odirty(); }); Bus.on('view', () => Panels.refresh('navigator'));
-  const slow = debounce(() => { Panels.refresh('navigator'); Panels.refresh('channels'); Panels.refresh('layers'); }, 180); Bus.on('pixels', slow);
+  const slow = debounce(() => { Panels.refresh('navigator'); Panels.refresh('channels'); Panels.refresh('layers'); Panels.refresh('histogram'); }, 180); Bus.on('pixels', slow);
   Tools.set('brush'); Docs.renderTabs(); View.updateStatus(); $('#emptyState').classList.add('on');
   Store.open().then(ok => { if (!ok) toast('Browser storage (IndexedDB) is unavailable: autosave and recent projects are disabled', 'warn', 5000); Welcome.show(); App.setAutosave(); });
 }
+/* Small automation surface: drive the editor from the console (or from automated
+   tests) without reaching into the closure, e.g.
+   PhotoStudio.Docs.create({ w: 800, h: 600, bg: 'white' })
+   await PhotoStudio.Pix.render(PhotoStudio.FX.byId.gaussian, imageData, 1)      */
+window.PhotoStudio = {
+  version: '2.0', App, Docs, Doc, Layer, Tools, Pix, FX, AdjustmentEngine, View, Panels,
+  Histogram, Dialog, Prefs, Hist, Selection, Color, Store, Exporter, LM, CE
+};
 try { boot(); } catch (e) { console.error(e); document.body.append(h('pre', { style: { position: 'fixed', inset: '20px', background: '#300', color: '#fff', padding: '16px', zIndex: 9999, overflow: 'auto' }, text: 'Startup error: ' + e.stack })); }
 
 
